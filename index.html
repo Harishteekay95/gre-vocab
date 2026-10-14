@@ -326,16 +326,86 @@ async function getJSON(url, ms = 8000) {
 }
 function stripHtml(h) { const d = document.createElement('div'); d.innerHTML = h || ''; return (d.textContent || '').replace(/\s+/g, ' ').trim(); }
 
+// --- tiny Wiktionary wikitext reader: synonyms, antonyms, usage examples, quotations ---
+function wtTemplates(s, test) { // top-level {{...}} blocks whose name passes test
+  const out = [];
+  for (let i = 0; i < s.length - 1; i++) {
+    if (s[i] !== '{' || s[i + 1] !== '{') continue;
+    let d = 0, j = i;
+    for (; j < s.length - 1; j++) {
+      if (s[j] === '{' && s[j + 1] === '{') { d++; j++; } else if (s[j] === '}' && s[j + 1] === '}') { d--; j++; if (!d) break; }
+    }
+    const body = s.slice(i + 2, j - 1);
+    if (test(body.split('|')[0].trim())) out.push(body);
+    i = j;
+  }
+  return out;
+}
+function wtParams(body) { // split on | that are not inside {{ }} or [[ ]]
+  const p = []; let d = 0, cur = '';
+  for (let i = 0; i < body.length; i++) {
+    const two = body.slice(i, i + 2);
+    if (two === '{{' || two === '[[') { d++; cur += two; i++; continue; }
+    if (two === '}}' || two === ']]') { d--; cur += two; i++; continue; }
+    if (body[i] === '|' && !d) { p.push(cur); cur = ''; continue; }
+    cur += body[i];
+  }
+  p.push(cur); return p.map(x => x.trim());
+}
+function wtClean(s) {
+  s = s.replace(/<!--[\s\S]*?-->/g, '').replace(/<ref[\s\S]*?(<\/ref>|\/>)/g, '');
+  for (let k = 0; k < 4; k++) s = s.replace(/\{\{([^{}]*)\}\}/g, (m, b) => { const p = b.split('|'); return /^(w|l|m|lang|smallcaps|gloss|nowrap)$/.test(p[0].trim()) ? (p[p.length - 1].includes('=') ? p[1] || '' : p[p.length - 1]) : ''; });
+  s = s.replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, '$1').replace(/'{2,}/g, '').replace(/<[^>]+>/g, '');
+  return s.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').replace(/\s+([,.;:!?])/g, '$1').trim();
+}
+function wtWords(body) { // {{syn|en|a|b<q:x>|Thesaurus:y}} -> [a, b]
+  return wtParams(body).slice(2).filter(x => x && !x.includes('=') && !/^Thesaurus:/i.test(x)).map(x => wtClean(x.split('<')[0])).filter(Boolean);
+}
+function readWikitext(wt) {
+  const res = {synonyms: [], antonyms: [], examples: [], quotes: []};
+  if (!wt) return res;
+  const a = wt.indexOf('==English=='); if (a < 0) return res;
+  const rest = wt.slice(a + 11); const b = rest.search(/\n==[^=]/);
+  const en = b < 0 ? rest : rest.slice(0, b);
+  // first definition that isn't obsolete/archaic, with its part of speech
+  let pos = '';
+  for (const line of en.split('\n')) {
+    const h = line.match(/^===+\s*(Noun|Verb|Adjective|Adverb)\s*===+/); if (h) { pos = h[1].toLowerCase(); continue; }
+    if (!pos || !/^# /.test(line)) continue;
+    const labels = wtTemplates(line, n => /^(lb|lbl|label)$/.test(n)).join('|');
+    const def = wtClean(line.slice(2));
+    if (def.length < 3) continue;
+    if (!res.anyMeaning) res.anyMeaning = {meaning: def, pos};
+    if (/obsolete|archaic|dated|historical|rare|nonstandard/i.test(labels)) continue;
+    res.meaning = def; res.pos = pos; break;
+  }
+  wtTemplates(en, n => /^(syn|synonyms)$/.test(n)).forEach(t => res.synonyms.push(...wtWords(t)));
+  wtTemplates(en, n => /^(ant|antonyms)$/.test(n)).forEach(t => res.antonyms.push(...wtWords(t)));
+  // ====Synonyms==== / ====Antonyms==== sections
+  for (const [key, re] of [['synonyms', /====\s*Synonyms\s*====([\s\S]*?)(?=\n=)/g], ['antonyms', /====\s*Antonyms\s*====([\s\S]*?)(?=\n=)/g]]) {
+    let m; while ((m = re.exec(en))) wtTemplates(m[1], n => /^(l|sense)$/.test(n)).forEach(t => { const p = wtParams(t); if (p[0] === 'l' && p[2]) res[key].push(wtClean(p[2])); });
+  }
+  wtTemplates(en, n => /^(ux|uxi|usex)$/.test(n)).forEach(t => { const p = wtParams(t).filter(x => !x.includes('=')); if (p[2]) res.examples.push(wtClean(p[2])); });
+  wtTemplates(en, n => /^quote-/.test(n)).forEach(t => {
+    const p = wtParams(t).find(x => /^(passage|text)\s*=/.test(x));
+    if (p) res.quotes.push(wtClean(p.replace(/^(passage|text)\s*=/, '')));
+  });
+  return res;
+}
+
 async function lookup(word) {
   const q = encodeURIComponent(norm(word));
-  const [dict, syn, ant, wik] = await Promise.all([
-    getJSON('https://api.dictionaryapi.dev/api/v2/entries/en/' + q),
+  const [dict, syn, ant, wik, raw, tat] = await Promise.all([
+    getJSON('https://api.dictionaryapi.dev/api/v2/entries/en/' + q, 5000),
     getJSON('https://api.datamuse.com/words?rel_syn=' + q + '&max=10'),
     getJSON('https://api.datamuse.com/words?rel_ant=' + q + '&max=6'),
     getJSON('https://en.wiktionary.org/api/rest_v1/page/definition/' + q + '?redirect=true'),
+    getJSON('https://en.wiktionary.org/w/api.php?action=parse&page=' + q + '&prop=wikitext&redirects=1&format=json&origin=*'),
+    getJSON('https://api.tatoeba.org/unstable/sentences?lang=eng&sort=relevance&limit=20&q=' + q),
   ]);
   const out = {pos: '', meaning: '', synonyms: [], antonyms: [], examples: []};
-  const add = (arr, v) => { v = String(v || '').trim(); if (v && norm(v) !== norm(word) && !arr.some(x => norm(x) === norm(v))) arr.push(v); };
+  const add = (arr, v) => { v = String(v || '').trim(); if (v && /[a-z]/i.test(v) && v.length < 40 && norm(v) !== norm(word) && !arr.some(x => norm(x) === norm(v))) arr.push(v); };
+  const ex = []; // [sentence, priority]
   let any = false;
   if (Array.isArray(dict)) {
     any = true;
@@ -343,7 +413,7 @@ async function lookup(word) {
       if (!out.pos) out.pos = m.partOfSpeech || '';
       for (const d of (m.definitions || [])) {
         if (!out.meaning && d.definition) out.meaning = d.definition;
-        if (d.example) add(out.examples, d.example);
+        if (d.example) ex.push([d.example, 0]);
         (d.synonyms || []).forEach(s => add(out.synonyms, s));
         (d.antonyms || []).forEach(s => add(out.antonyms, s));
       }
@@ -351,21 +421,31 @@ async function lookup(word) {
       (m.antonyms || []).forEach(s => add(out.antonyms, s));
     }
   }
-  if (Array.isArray(syn)) { any = any || syn.length > 0; syn.forEach(x => add(out.synonyms, x.word)); }
-  if (Array.isArray(ant)) ant.forEach(x => add(out.antonyms, x.word));
+  const w = readWikitext(raw && raw.parse && raw.parse.wikitext && raw.parse.wikitext['*']);
+  if (!out.meaning && (w.meaning || w.anyMeaning)) { const m = w.meaning ? w : w.anyMeaning; out.meaning = m.meaning; out.pos = out.pos || m.pos; any = true; }
   if (wik && Array.isArray(wik.en)) {
-    any = true;
     for (const p of wik.en) for (const d of (p.definitions || [])) {
       const def = stripHtml(d.definition);
-      if (!out.meaning && def) { out.meaning = def; if (!out.pos) out.pos = (p.partOfSpeech || '').toLowerCase(); }
-      (d.parsedExamples || []).forEach(x => add(out.examples, stripHtml(x.example)));
-      (d.examples || []).forEach(x => add(out.examples, stripHtml(x)));
+      if (!out.meaning && def) { any = true; out.meaning = def; if (!out.pos) out.pos = (p.partOfSpeech || '').toLowerCase(); }
+      (d.parsedExamples || []).forEach(x => ex.push([stripHtml(x.example), 1]));
+      (d.examples || []).forEach(x => ex.push([stripHtml(x), 1]));
     }
   }
-  // prefer readable examples that actually contain the word
-  const re = wordRegex(word);
-  out.examples = out.examples.filter(x => x.length >= 20 && x.length <= 240)
-    .sort((a, b) => (re.test(b) - re.test(a)) || (Math.abs(a.length - 90) - Math.abs(b.length - 90)));
+  w.synonyms.forEach(s => add(out.synonyms, s));
+  w.antonyms.forEach(s => add(out.antonyms, s));
+  w.examples.forEach(s => ex.push([s, 1]));
+  if (tat && Array.isArray(tat.data)) tat.data.forEach(x => ex.push([x.text, 2]));
+  w.quotes.forEach(s => ex.push([s, 3]));
+  if (Array.isArray(syn)) { any = any || syn.length > 0; syn.forEach(x => add(out.synonyms, x.word)); }
+  if (Array.isArray(ant)) ant.forEach(x => add(out.antonyms, x.word));
+  // keep readable sentences that actually use the word; prefer modern, mid-length ones
+  const re = wordRegex(word), seen = new Set();
+  out.examples = ex.map(([s, p]) => [String(s || '').replace(/\s+/g, ' ').trim(), p])
+    .filter(([s]) => s.length >= 15 && s.length <= 220 && re.test(s) && !/^\(/.test(s) && !seen.has(norm(s)) && seen.add(norm(s)))
+    .sort((a, b) => (a[1] - b[1]) || (Math.abs(a[0].length - 80) - Math.abs(b[0].length - 80)))
+    .map(x => x[0]);
+  // two different sentences, ideally from different sources
+  if (out.examples.length > 2) out.examples = [out.examples[0], out.examples.find((s, i) => i > 0 && s.split(' ').length > 5) || out.examples[1]];
   out.synonyms = out.synonyms.slice(0, 6);
   out.antonyms = out.antonyms.slice(0, 4);
   out.examples = out.examples.slice(0, 2);
