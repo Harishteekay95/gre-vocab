@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when you change any file.
-const VERSION = 'gre-vocab-v3';
+const VERSION = 'gre-vocab-v4';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(ASSETS.map(u => new Request(u, {cache: 'reload'})))).then(() => self.skipWaiting()));

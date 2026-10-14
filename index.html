@@ -97,7 +97,7 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 <header>
   <h1 id="title">My Words</h1>
   <button class="icon-btn" id="installBtn" hidden>Install</button>
-  <button class="icon-btn" id="menuBtn" aria-label="Backup">Backup</button>
+  <button class="icon-btn" id="menuBtn" aria-label="Sync and backup">Sync</button>
 </header>
 
 <main>
@@ -165,9 +165,12 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 
 <!-- backup -->
 <dialog id="menuDlg"><div class="dlg">
-  <h3>Backup</h3>
-  <p class="small muted" style="margin:0">Your words live only on this phone. Export a backup now and then, especially before clearing browser data.</p>
-  <button class="btn" id="exportBtn">Export words (.json)</button>
+  <h3>Sync across devices</h3>
+  <p class="small muted" style="margin:0" id="syncState">Sign in with the same Google account on your phone, laptop and tablet to see the same words everywhere.</p>
+  <button class="btn" id="signInBtn">Sign in with Google</button>
+  <button class="btn line" id="signOutBtn" hidden>Sign out</button>
+  <h3 style="margin-top:8px">Backup</h3>
+  <button class="btn ghost" id="exportBtn">Export words (.json)</button>
   <button class="btn ghost" id="importBtn">Import from backup</button>
   <input type="file" id="importFile" accept=".json,application/json" hidden>
   <button class="btn line" id="menuClose">Close</button>
@@ -551,7 +554,7 @@ $('#edCancel').onclick = () => { lookupSeq++; $('#editDlg').close(); };
 $('#edDelete').onclick = () => {
   if (!editing) return;
   if (!confirm('Delete "' + editing.word + '"?')) return;
-  S.words = S.words.filter(w => w !== editing); save(); $('#editDlg').close(); renderWords(); toast('Deleted');
+  S.words = S.words.filter(w => w !== editing); removedKey(docKey(editing.word)); $('#editDlg').close(); renderWords(); toast('Deleted');
 };
 $('#editForm').onsubmit = e => {
   e.preventDefault();
@@ -561,9 +564,11 @@ $('#editForm').onsubmit = e => {
   if (dupe && dupe !== editing) { toast('That word is already in your list'); return; }
   lookupSeq++;
   const w = editing || newWord(f.word);
+  const oldKey = editing ? docKey(editing.word) : null;
   Object.assign(w, f);
   if (!editing) S.words.push(w);
-  save(); $('#editDlg').close(); renderWords();
+  if (oldKey && oldKey !== docKey(w.word)) removedKey(oldKey); // renamed
+  changed(w); $('#editDlg').close(); renderWords();
   toast(editing ? 'Saved' : 'Added "' + w.word + '"');
 };
 
@@ -576,7 +581,7 @@ $('#bulkForm').onsubmit = async e => {
   $('#bulkDlg').close();
   if (!words.length) { toast('Nothing new to add'); return; }
   const created = words.map(newWord);
-  S.words.push(...created); save(); renderWords();
+  S.words.push(...created); changed(created); renderWords();
   await fillMissing(created);
 };
 async function fillMissing(words) {
@@ -585,8 +590,8 @@ async function fillMissing(words) {
   for (const w of words) {
     toast('Looking up ' + (++done) + ' of ' + words.length + '…', 60000);
     const r = await lookup(w.word);
-    if (r.found || r.synonyms.length) applyLookup(w, r, false); else miss++;
-    save(); if (current === 'words') renderWords();
+    if (r.found || r.synonyms.length) { applyLookup(w, r, false); changed(w); } else miss++;
+    if (current === 'words') renderWords();
   }
   toast(miss ? `Done. ${miss} word(s) not found — tap them to type details` : 'All details filled', 3500);
 }
@@ -616,7 +621,7 @@ function startCards(words) {
 function grade(w, ok) {
   w.seen = (w.seen || 0) + 1; w.lastSeen = Date.now();
   if (ok) { w.correct = (w.correct || 0) + 1; w.box = Math.min(5, (w.box || 0) + 1); } else w.box = 0;
-  save();
+  changed(w);
 }
 function cardBack(w) {
   const syn = w.synonyms.length ? `<h4>Synonyms</h4><div class="chips">${w.synonyms.map(s => `<span class="chip">${esc(s)}</span>`).join('')}</div>` : '';
@@ -773,7 +778,6 @@ function renderQ() {
 }
 
 /* ---------- backup ---------- */
-$('#menuBtn').onclick = () => $('#menuDlg').showModal();
 $('#menuClose').onclick = () => $('#menuDlg').close();
 $('#exportBtn').onclick = () => {
   const blob = new Blob([JSON.stringify({app: 'gre-vocab', version: 1, exportedAt: new Date().toISOString(), words: S.words}, null, 1)], {type: 'application/json'});
@@ -787,17 +791,135 @@ $('#importFile').onchange = async e => {
   try {
     const data = JSON.parse(await f.text());
     const arr = Array.isArray(data) ? data : data.words;
-    let added = 0;
+    const added = [];
     for (const x of arr || []) {
       if (!x || !x.word || findWord(x.word)) continue;
       const w = Object.assign(newWord(x.word), x, {id: x.id || uid()});
       for (const k of ['synonyms', 'antonyms', 'examples']) if (!Array.isArray(w[k])) w[k] = [];
-      S.words.push(w); added++;
+      delete w.updatedAt; S.words.push(w); added.push(w);
     }
-    save(); renderWords(); $('#menuDlg').close(); toast('Imported ' + added + ' new word(s)');
+    changed(added); renderWords(); $('#menuDlg').close(); toast('Imported ' + added.length + ' new word(s)');
   } catch (err) { toast('That file could not be read'); }
   e.target.value = '';
 };
+
+/* ---------- sync across devices: Firebase (free) + Sign in with Google ---------- */
+// Words stay saved on the device first (works offline); when signed in, each word is
+// also stored at users/<your id>/words/<word> in Firestore, and every device listens for changes.
+const FB_CONFIG = {
+  apiKey: 'AIzaSyDubZ_v0KNFn81V1gwyObWQJWfITdlspMY',
+  authDomain: 'gre-vocab-8a375.firebaseapp.com',
+  projectId: 'gre-vocab-8a375',
+  storageBucket: 'gre-vocab-8a375.firebasestorage.app',
+  messagingSenderId: '935140086488',
+  appId: '1:935140086488:web:3114c17c0f97d0ac81fdad'
+};
+const FB_SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
+let fb = null, fbLoading = null, fbUser = null, fbUnsub = null, remoteReady = false;
+if (!S.deleted || typeof S.deleted !== 'object') S.deleted = {};
+
+const docKey = w => (norm(w).replace(/\//g, '∕').replace(/^\.\.?$/, '_') || '_').slice(0, 200);
+function changed(words) {
+  const now = Date.now();
+  for (const w of [].concat(words)) { w.updatedAt = now; delete S.deleted[docKey(w.word)]; push(w); }
+  save();
+}
+function removedKey(k) { S.deleted[k] = Date.now(); save(); pushDelete(k); }
+
+function wordRef(k) { return fb.F.doc(fb.db, 'users', fbUser.uid, 'words', k); }
+function push(w) {
+  if (!fb || !fbUser || !remoteReady) return; // pushed later, when the first sync completes
+  if (!w.updatedAt) w.updatedAt = w.addedAt || Date.now();
+  const data = JSON.parse(JSON.stringify(w)); delete data.deleted;
+  fb.F.setDoc(wordRef(docKey(w.word)), data).catch(e => setSync('error', e));
+}
+function pushDelete(k) {
+  if (!fb || !fbUser || !remoteReady) return;
+  fb.F.setDoc(wordRef(k), {deleted: true, updatedAt: S.deleted[k] || Date.now()}).catch(e => setSync('error', e));
+}
+
+function applyRemote(snap) {
+  if (!remoteReady && snap.metadata.fromCache) return; // wait for the server's copy before the first merge
+  let dirty = false;
+  const remote = {};
+  snap.forEach(d => {
+    const r = d.data(), k = d.id, rt = r.updatedAt || 0;
+    remote[k] = rt;
+    const local = S.words.find(w => docKey(w.word) === k);
+    const lt = local ? (local.updatedAt || 0) : (S.deleted[k] || 0);
+    if (rt <= lt) return; // this device already has the newest version
+    if (r.deleted) {
+      if (local) { S.words = S.words.filter(w => w !== local); dirty = true; }
+      S.deleted[k] = rt; return;
+    }
+    const w = Object.assign(local || {}, r);
+    for (const f of ['synonyms', 'antonyms', 'examples']) if (!Array.isArray(w[f])) w[f] = [];
+    if (!local) S.words.push(w);
+    delete S.deleted[k]; dirty = true;
+  });
+  if (!remoteReady) { // first sync after sign-in: upload what only this device has, or has newer
+    remoteReady = true;
+    S.words.forEach(w => { const k = docKey(w.word); if (!(k in remote) || (w.updatedAt || 0) > remote[k]) push(w); });
+    Object.entries(S.deleted).forEach(([k, t]) => { if (k in remote && t > remote[k]) pushDelete(k); });
+    setSync('on');
+  }
+  if (dirty) { save(); if (current === 'words') renderWords(); if (current === 'quiz' && !Q.length) renderQuizHome(); }
+}
+
+function setSync(state, err) {
+  const name = fbUser && (fbUser.displayName || fbUser.email) || '';
+  const btn = $('#menuBtn'), st = $('#syncState');
+  $('#signInBtn').hidden = state === 'on' || state === 'connecting';
+  $('#signOutBtn').hidden = !(state === 'on' || state === 'connecting');
+  $('#signInBtn').disabled = false;
+  if (state === 'on') { btn.textContent = '✓ Synced'; st.textContent = 'Signed in as ' + name + '. Words you add or practise sync to your other devices.'; }
+  else if (state === 'connecting') { btn.textContent = 'Syncing…'; st.textContent = 'Signed in as ' + name + '. Syncing…'; }
+  else if (state === 'error') { btn.textContent = 'Sync'; st.textContent = 'Sync problem: ' + ((err && (err.code || err.message)) || 'unknown') + '. Your words are still saved on this device.'; }
+  else { btn.textContent = 'Sync'; st.textContent = 'Sign in with the same Google account on your phone, laptop and tablet to see the same words everywhere.'; }
+}
+
+function fbLoad() {
+  if (fbLoading) return fbLoading;
+  if (FB_CONFIG.apiKey.startsWith('__')) return Promise.reject(new Error('not set up'));
+  fbLoading = Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map(f => import(FB_SDK + f)))
+    .then(([app, A, F]) => {
+      const a = app.initializeApp(FB_CONFIG);
+      fb = {auth: A.getAuth(a), db: F.getFirestore(a), A, F};
+      A.onAuthStateChanged(fb.auth, onUser);
+      A.getRedirectResult(fb.auth).catch(() => {});
+      return fb;
+    })
+    .catch(e => { fbLoading = null; throw e; });
+  return fbLoading;
+}
+function onUser(u) {
+  if (fbUnsub) { fbUnsub(); fbUnsub = null; }
+  fbUser = u; remoteReady = false;
+  try { u ? localStorage.setItem('gre-sync', '1') : localStorage.removeItem('gre-sync'); } catch (e) {}
+  if (!u) { setSync('off'); return; }
+  setSync('connecting');
+  fbUnsub = fb.F.onSnapshot(fb.F.collection(fb.db, 'users', u.uid, 'words'), {includeMetadataChanges: true}, applyRemote, e => setSync('error', e));
+}
+
+$('#menuBtn').onclick = () => { $('#menuDlg').showModal(); if (navigator.onLine) fbLoad().catch(() => {}); };
+$('#signInBtn').onclick = async () => {
+  if (!navigator.onLine) { toast('Connect to the internet to sign in'); return; }
+  $('#signInBtn').disabled = true;
+  try {
+    await fbLoad();
+    try { await fb.A.signInWithPopup(fb.auth, new fb.A.GoogleAuthProvider()); }
+    catch (e) {
+      if (/popup-blocked|operation-not-supported/.test(e.code || '')) await fb.A.signInWithRedirect(fb.auth, new fb.A.GoogleAuthProvider());
+      else if (!/popup-closed|cancelled-popup/.test(e.code || '')) throw e;
+    }
+  } catch (e) { setSync('error', e); }
+  $('#signInBtn').disabled = false;
+};
+$('#signOutBtn').onclick = async () => { if (fb) await fb.A.signOut(fb.auth); toast('Signed out. Your words stay on this device.'); };
+// reconnect automatically on devices that signed in before
+function autoSync() { try { if (localStorage.getItem('gre-sync') && navigator.onLine) fbLoad().catch(() => {}); } catch (e) {} }
+window.addEventListener('online', autoSync);
+autoSync();
 
 /* ---------- install + offline ---------- */
 let installEvt;
